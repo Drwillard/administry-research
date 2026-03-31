@@ -9,5 +9,7 @@ services:
       - DATABASE_URL=${DATABASE_URL}
       - ANON_SALT=${ANON_SALT}
       - OUT_DIR=/app/out
+      - STOPWORDS_FILE=/app/stopwords.txt
     volumes:
       - ./out:/app/out
+      - ./stopwords.txt:/app/stopwords.txt

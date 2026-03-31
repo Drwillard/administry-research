@@ -46,6 +46,7 @@ Identifies staff authors whose note sentiment is trending downward over time —
 | `min_notes` | 5 | Minimum number of notes required to include an author |
 | `slope_threshold` | 0.0 | Only return authors whose slope is below this value (negative = declining) |
 | `limit` | 20 | Maximum number of results to return |
+| `agency_id` | — | Optional. Filter results to a specific agency |
 
 Results are sorted by most recent note first.
 
@@ -57,12 +58,55 @@ Identifies clients whose note sentiment is trending downward over time — a pot
 | `min_notes` | 5 | Minimum number of notes required to include a client |
 | `slope_threshold` | 0.0 | Only return clients whose slope is below this value (negative = declining) |
 | `limit` | 20 | Maximum number of results to return |
+| `agency_id` | — | Optional. Filter results to a specific agency |
 
 Results are sorted by most recent note first.
 
+### `GET /analyze/client-themes`
+Discovers recurring themes across client notes using unsupervised topic modelling (TF-IDF + NMF), then scores each client's notes against the discovered topics.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `n_topics` | 10 | Number of themes to discover across all notes |
+| `top_keywords` | 5 | Number of keywords used to label each theme |
+| `min_notes` | 3 | Minimum number of notes required to include a client |
+| `limit` | 20 | Maximum number of results to return |
+| `agency_id` | — | Optional. Filter results to a specific agency |
+
+Results are sorted by most recent note first.
+
+**Response structure:**
+
+```json
+{
+  "topics_discovered": 10,
+  "clients_analysed": 142,
+  "global_topics": [
+    { "topic_id": 0, "keywords": ["housing", "rent", "eviction", "landlord", "shelter"] }
+  ],
+  "results": [
+    {
+      "client_key": "abc...",
+      "note_count": 12,
+      "last_note": "2024-03-15T10:00:00+00:00",
+      "top_themes": [
+        { "topic_id": 0, "keywords": ["housing", "rent", "..."], "proportion": 0.45 }
+      ]
+    }
+  ]
+}
+```
+
+`proportion` reflects what share of the client's note content aligns with that theme (0–1). The `global_topics` list defines all discovered topics and their keywords for the full corpus (or agency subset if `agency_id` was provided).
+
+**Customising theme quality:**
+- Add domain-specific filler words (e.g. `discussed`, `meeting`, `follow`) to `stopwords.txt` — changes take effect on the next request without restarting
+- Increase `n_topics` to get finer-grained themes; decrease it if topics feel too fragmented
+- `top_keywords` controls how many words label each theme in the response
+
 ### How the sentiment trend is calculated
 
-Both endpoints use the same algorithm:
+Both `/analyze/author-burnout` and `/analyze/clients-at-risk` use the same algorithm:
 
 1. **Sentiment scoring** — each note's text is scored by VADER (Valence Aware Dictionary and sEntiment Reasoner), producing a `sentiment_compound` value between -1.0 (most negative) and +1.0 (most positive).
 

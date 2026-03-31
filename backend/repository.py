@@ -17,6 +17,7 @@ def fetch_notes(database_url: str) -> pd.DataFrame:
     q = text("""
         SELECT
             noteID,
+            agencyID,
             clientID,
             personID,
             ddate,
@@ -51,6 +52,7 @@ def write_timeseries_packed(notes_long: pd.DataFrame) -> None:
             events.append({
                 "t": None if pd.isna(r["ddate"]) else r["ddate"].isoformat(),
                 "note_id": int(r["noteID"]) if not pd.isna(r["noteID"]) else None,
+                "agency": r.get("agency_key"),
                 "author": r.get("author_key"),
                 "privacy": int(r["iprivacy"]) if "iprivacy" in r and not pd.isna(r["iprivacy"]) else None,
                 "sticky": bool(r["bsticky"]) if "bsticky" in r and not pd.isna(r["bsticky"]) else None,

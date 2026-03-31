@@ -1,9 +1,12 @@
 # analytics.py — business logic: PII scrubbing, sentiment analysis, anonymisation, pipeline, trend analysis
-import os, re, hmac, hashlib, logging
+import os, re, hmac, hashlib, html, json, logging
+from html.parser import HTMLParser
 from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
+from sklearn.decomposition import NMF
+from sklearn.feature_extraction.text import TfidfVectorizer
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 import repository
@@ -13,6 +16,55 @@ log = logging.getLogger("pipeline")
 ANON_SALT = os.environ.get("ANON_SALT")
 
 _sia = SentimentIntensityAnalyzer()
+
+# --- HTML stripping ---
+class _HTMLStripper(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self._parts = []
+
+    def handle_data(self, data):
+        self._parts.append(data)
+
+    def get_text(self):
+        return " ".join(self._parts)
+
+
+def _extract_quill(text: str) -> str:
+    """
+    If text is a Quill Delta JSON object, extract plain text from the ops array.
+    Each op with a string 'insert' value contributes its text; embedded objects
+    (e.g. images) are skipped. Returns the original string unchanged if it isn't
+    valid Quill JSON.
+    """
+    stripped = text.strip()
+    if not (stripped.startswith('{') or stripped.startswith('[')):
+        return text
+    try:
+        data = json.loads(stripped)
+        # Quill Delta: {"ops": [...]} or just the ops array directly
+        ops = data.get("ops") if isinstance(data, dict) else data
+        if not isinstance(ops, list):
+            return text
+        parts = [op["insert"] for op in ops if isinstance(op.get("insert"), str)]
+        return "".join(parts)
+    except (json.JSONDecodeError, AttributeError):
+        return text
+
+
+_DOCTYPE_RE = re.compile(r'<!DOCTYPE[^>]*>', re.IGNORECASE)
+_COMMENT_RE = re.compile(r'<!--.*?-->', re.DOTALL)
+
+
+def _strip_html(text: str) -> str:
+    """Remove HTML tags, doctype declarations, comments, and unescape entities."""
+    text = _DOCTYPE_RE.sub('', text)
+    text = _COMMENT_RE.sub('', text)
+    text = html.unescape(text)
+    stripper = _HTMLStripper()
+    stripper.feed(text)
+    return stripper.get_text()
+
 
 # --- PII scrubbing ---
 _PHONE_RE = re.compile(r"(?<!\d)(?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}(?!\d)")
@@ -26,6 +78,8 @@ def scrub_text(x: Any) -> Any:
         return x
     if not isinstance(x, str):
         return x
+    x = _extract_quill(x)
+    x = _strip_html(x)
     x = _EMAIL_RE.sub("[EMAIL]", x)
     x = _PHONE_RE.sub("[PHONE]", x)
     x = _SSN_RE.sub("[SSN]", x)
@@ -93,7 +147,8 @@ def run_pipeline() -> dict:
     log.info("anonymising IDs")
     notes["client_key"] = notes["clientID"].apply(lambda v: stable_hmac(v, salt))
     notes["author_key"] = notes["personID"].apply(lambda v: stable_hmac(v, salt))
-    notes = notes.drop(columns=[c for c in ["clientID", "personID"] if c in notes.columns])
+    notes["agency_key"] = notes["agencyID"].apply(lambda v: stable_hmac(v, salt))
+    notes = notes.drop(columns=[c for c in ["clientID", "personID", "agencyID"] if c in notes.columns])
 
     notes_long = repository.write_notes_by_client(notes)
     repository.write_timeseries_packed(notes_long)
@@ -133,7 +188,13 @@ def sentiment_slope(group: pd.DataFrame, key_col: str) -> Optional[dict]:
     }
 
 
-def load_sentiment_trends(parquet_filename: str, key_col: str, min_notes: int, slope_threshold: float) -> list[dict]:
+def load_sentiment_trends(
+    parquet_filename: str,
+    key_col: str,
+    min_notes: int,
+    slope_threshold: float,
+    agency_key: Optional[str] = None,
+) -> list[dict]:
     """
     Load a notes parquet file and return sentiment trend rows for groups whose
     slope is below slope_threshold and have at least min_notes scored notes.
@@ -147,6 +208,9 @@ def load_sentiment_trends(parquet_filename: str, key_col: str, min_notes: int, s
 
     df["ddate"] = pd.to_datetime(df["ddate"], utc=True, errors="coerce")
 
+    if agency_key is not None:
+        df = df[df["agency_key"] == agency_key]
+
     results = []
     for _, group in df.groupby(key_col):
         if group["sentiment_compound"].dropna().shape[0] < min_notes:
@@ -157,3 +221,120 @@ def load_sentiment_trends(parquet_filename: str, key_col: str, min_notes: int, s
 
     results.sort(key=lambda r: r["last_note"], reverse=True)
     return results
+
+
+_STOPWORDS_FILE = os.environ.get("STOPWORDS_FILE", "./stopwords.txt")
+
+
+def _load_stopwords() -> list[str]:
+    """Read custom stopwords from file, ignoring comments and blank lines."""
+    try:
+        with open(_STOPWORDS_FILE, encoding="utf-8") as f:
+            return [
+                line.strip().lower()
+                for line in f
+                if line.strip() and not line.startswith("#")
+            ]
+    except FileNotFoundError:
+        log.warning("Stopwords file not found at %s — using sklearn defaults only", _STOPWORDS_FILE)
+        return []
+
+
+def extract_client_themes(
+    n_topics: int,
+    top_keywords: int,
+    min_notes: int,
+    agency_key: Optional[str] = None,
+) -> tuple[list[dict], list[dict]]:
+    """
+    Discover themes across all client notes using TF-IDF + NMF, then score each
+    client's notes against the global topics.
+
+    Algorithm:
+      1. Load notes_long_by_client.parquet and drop rows with no note text.
+      2. Fit a TF-IDF matrix over all individual notes (global vocabulary).
+      3. Factorize with NMF into n_topics latent topics. Each topic is a weighted
+         set of vocabulary terms — the top-weighted terms become its keyword label.
+      4. For each client, sum their per-note topic vectors to get a client-level
+         topic distribution, then normalise to proportions.
+      5. Return each client's top themes ranked by proportion, plus the global
+         topic definitions for reference.
+
+    Returns (client_results, topics) where topics is the global keyword list.
+    """
+    custom_stopwords = _load_stopwords()
+
+    df = repository.read_parquet("notes_long_by_client.parquet")
+
+    if agency_key is not None:
+        df = df[df["agency_key"] == agency_key]
+
+    df["ddate"] = pd.to_datetime(df["ddate"], utc=True, errors="coerce")
+    df = df.dropna(subset=["vnote"]).copy()
+    df["vnote"] = df["vnote"].astype(str).str.strip()
+    df = df[df["vnote"] != ""]
+
+    # Step 1 — fit TF-IDF over all notes
+    # Merge sklearn's built-in English stopwords with the custom list from file
+    from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+    stopwords = list(ENGLISH_STOP_WORDS.union(custom_stopwords))
+
+    vectorizer = TfidfVectorizer(
+        stop_words=stopwords,
+        min_df=2,           # ignore terms that appear in fewer than 2 notes
+        max_df=0.95,        # ignore terms that appear in >95% of notes (too common)
+        ngram_range=(1, 2), # unigrams and bigrams
+        max_features=5000,
+        token_pattern=r"(?u)\b[^\W\d]{3,}\b",  # letters only, 3+ chars (no numbers, no 2-letter words)
+    )
+    tfidf_matrix = vectorizer.fit_transform(df["vnote"])
+    feature_names = vectorizer.get_feature_names_out()
+
+    # Step 2 — NMF topic factorization
+    nmf = NMF(n_components=n_topics, random_state=42, max_iter=400)
+    note_topic_matrix = nmf.fit_transform(tfidf_matrix)  # shape: (notes, topics)
+
+    # Step 3 — build global topic definitions from top keywords
+    topics = []
+    for topic_idx, component in enumerate(nmf.components_):
+        top_indices = component.argsort()[::-1][:top_keywords]
+        topics.append({
+            "topic_id": topic_idx,
+            "keywords": [feature_names[i] for i in top_indices],
+        })
+
+    # Step 4 — aggregate per-client topic distributions
+    df = df.reset_index(drop=True)
+    df["_row"] = df.index
+
+    results = []
+    for client_key, group in df.groupby("client_key"):
+        if len(group) < min_notes:
+            continue
+
+        rows = group["_row"].values
+        client_topic_scores = note_topic_matrix[rows].sum(axis=0)
+        total = client_topic_scores.sum()
+        if total == 0:
+            continue
+
+        proportions = client_topic_scores / total
+        top_indices = proportions.argsort()[::-1][:3]
+
+        results.append({
+            "client_key": client_key,
+            "note_count": len(group),
+            "last_note": group["ddate"].max().isoformat(),
+            "top_themes": [
+                {
+                    "topic_id": int(i),
+                    "keywords": topics[i]["keywords"],
+                    "proportion": round(float(proportions[i]), 4),
+                }
+                for i in top_indices
+                if proportions[i] > 0
+            ],
+        })
+
+    results.sort(key=lambda r: r["last_note"], reverse=True)
+    return results, topics
