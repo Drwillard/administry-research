@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - ANON_SALT=${ANON_SALT}
+      - OUT_DIR=/app/out
+    volumes:
+      - ./out:/app/out
