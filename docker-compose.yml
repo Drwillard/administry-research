@@ -10,6 +10,7 @@ services:
       - ANON_SALT=${ANON_SALT}
       - OUT_DIR=/app/out
       - STOPWORDS_FILE=/app/stopwords.txt
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
     volumes:
       - ./out:/app/out
       - ./stopwords.txt:/app/stopwords.txt

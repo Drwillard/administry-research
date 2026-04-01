@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.openapi.docs import get_swagger_ui_html
 
 from repository import DATABASE_URL
-from analytics import ANON_SALT, run_pipeline, load_sentiment_trends, extract_client_themes, stable_hmac
+from analytics import ANON_SALT, ANTHROPIC_API_KEY, run_pipeline, load_sentiment_trends, extract_client_themes, stable_hmac, summarise_client_notes
 
 
 def _agency_key(agency_id: Optional[str]) -> Optional[str]:
@@ -130,6 +130,33 @@ def client_themes(
         "topics_discovered": len(topics),
         "clients_analysed": len(results),
         "global_topics": topics,
+        "results": results[:limit],
+    }
+
+
+@app.get("/analyze/client/v2")
+async def client_notes_v2(
+    min_notes: int = Query(default=3, description="Minimum notes required to include a client"),
+    max_notes_per_client: int = Query(default=10, description="Maximum notes to summarise per client"),
+    limit: int = Query(default=20, description="Maximum number of clients to return"),
+    agency_id: Optional[str] = Query(default=None, description="Filter to a specific agency"),
+):
+    """
+    Use an LLM to summarise each client note into a short phrase.
+    Returns a per-client list of note summaries, sorted by most recent note first.
+    Requires notes_long_by_client.parquet to exist (run /ingest first).
+    """
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured.")
+    try:
+        results = await summarise_client_notes(min_notes, _agency_key(agency_id), max_notes_per_client)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="No data found. Run /ingest first.")
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {
+        "clients_analysed": len(results),
         "results": results[:limit],
     }
 

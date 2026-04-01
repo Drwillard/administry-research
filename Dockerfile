@@ -12,7 +12,8 @@ RUN pip install --no-cache-dir \
     uvicorn[standard] \
     aiofiles \
     vaderSentiment \
-    scikit-learn
+    scikit-learn \
+    anthropic
 
 # Bundle Swagger UI assets locally (avoids CDN dependency)
 RUN mkdir -p /app/static && \
