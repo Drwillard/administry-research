@@ -12,31 +12,57 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 
 
 def fetch_notes(database_url: str) -> pd.DataFrame:
-    """Query all notes with a date from the database and return as a DataFrame."""
+    """Query notes and pledges, returning a unified DataFrame with a composite event_id."""
     engine = create_engine(database_url)
     q = text("""
         SELECT
             noteID,
+            NULL AS pledgeID,
             agencyID,
             clientID,
-            personID,
+            personID AS caseworkerID,
             ddate,
-            vnote,
-            iprivacy,
-            bsticky
+            vnote
         FROM `Note`
         WHERE ddate IS NOT NULL
+
+        UNION ALL
+
+        SELECT
+            NULL AS noteID,
+            p.pledgeID,
+            p.agencyID,
+            p.clientID,
+            p.caseworkerID,
+            p.ddate,
+            CONCAT(g.vname, ' pledge made for ', p.decamount, ' - note: ', COALESCE(p.vnote, '')) AS vnote
+        FROM Pledge p
+        JOIN Vendor v ON p.vendorID = v.vendorID
+        JOIN GL g ON v.glID = g.glID
+        WHERE p.bvoid = 0
+          AND p.bpending = 0
+          AND p.ddate IS NOT NULL
     """)
-    notes = pd.read_sql(q, engine)
-    log.info("fetched %d rows", len(notes))
-    return notes
+    df = pd.read_sql(q, engine)
+
+    # Composite key: "n-123" for notes, "p-456" for pledges
+    df["event_id"] = df.apply(
+        lambda r: f"n-{int(r['noteID'])}" if pd.notna(r["noteID"]) else f"p-{int(r['pledgeID'])}",
+        axis=1,
+    )
+    df = df.drop(columns=["noteID", "pledgeID"])
+
+    log.info("fetched %d rows (%d notes, %d pledges)", len(df),
+             df["event_id"].str.startswith("n-").sum(),
+             df["event_id"].str.startswith("p-").sum())
+    return df
 
 
 def write_notes_by_client(df: pd.DataFrame) -> pd.DataFrame:
     """Sort and write the long-format client notes parquet. Returns the written DataFrame."""
     notes_long = (
         df.dropna(subset=["client_key", "ddate"])
-          .sort_values(["client_key", "ddate", "noteID"], kind="mergesort")
+          .sort_values(["client_key", "ddate", "event_id"], kind="mergesort")
           .reset_index(drop=True)
     )
     notes_long.to_parquet(os.path.join(OUT_DIR, "notes_long_by_client.parquet"), index=False)
@@ -51,11 +77,9 @@ def write_timeseries_packed(notes_long: pd.DataFrame) -> None:
         for _, r in g.iterrows():
             events.append({
                 "t": None if pd.isna(r["ddate"]) else r["ddate"].isoformat(),
-                "note_id": int(r["noteID"]) if not pd.isna(r["noteID"]) else None,
+                "event_id": r.get("event_id"),
                 "agency": r.get("agency_key"),
                 "author": r.get("author_key"),
-                "privacy": int(r["iprivacy"]) if "iprivacy" in r and not pd.isna(r["iprivacy"]) else None,
-                "sticky": bool(r["bsticky"]) if "bsticky" in r and not pd.isna(r["bsticky"]) else None,
                 "text": r.get("vnote"),
             })
         return json.dumps(events, ensure_ascii=False)
@@ -77,7 +101,7 @@ def write_client_summary(notes_long: pd.DataFrame) -> None:
                   .agg(
                       first_note=("ddate", "min"),
                       last_note=("ddate", "max"),
-                      note_count=("noteID", "count"),
+                      note_count=("event_id", "count"),
                       avg_note_len=("note_len", "mean"),
                       max_note_len=("note_len", "max"),
                   )
@@ -91,12 +115,19 @@ def write_notes_by_author(df: pd.DataFrame) -> pd.DataFrame:
     """Sort and write the long-format author notes parquet. Returns the written DataFrame."""
     notes_by_author = (
         df.dropna(subset=["author_key", "ddate"])
-          .sort_values(["author_key", "ddate", "noteID"], kind="mergesort")
+          .sort_values(["author_key", "ddate", "event_id"], kind="mergesort")
           .reset_index(drop=True)
     )
     notes_by_author.to_parquet(os.path.join(OUT_DIR, "notes_long_by_author.parquet"), index=False)
     log.info("wrote notes_long_by_author.parquet (%d rows)", len(notes_by_author))
     return notes_by_author
+
+
+def write_note_summaries(records: list[dict]) -> None:
+    """Write flat note summary rows to parquet (one row per note). Overwrites existing file."""
+    df = pd.DataFrame(records)
+    df.to_parquet(os.path.join(OUT_DIR, "note_summaries.parquet"), index=False)
+    log.info("wrote note_summaries.parquet (%d rows, %d clients)", len(df), df["client_key"].nunique())
 
 
 def read_parquet(filename: str) -> pd.DataFrame:

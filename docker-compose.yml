@@ -1,6 +1,29 @@
 version: '3.8'
 
 services:
+  ollama:
+    image: ollama/ollama
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  ollama-init:
+    image: ollama/ollama
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=ollama
+    depends_on:
+      ollama:
+        condition: service_healthy
+    command: pull ${OLLAMA_MODEL:-qwen2.5:3b}
+    restart: "no"
+
   app:
     build: .
     ports:
@@ -10,7 +33,14 @@ services:
       - ANON_SALT=${ANON_SALT}
       - OUT_DIR=/app/out
       - STOPWORDS_FILE=/app/stopwords.txt
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - OLLAMA_BASE_URL=http://ollama:11434/v1
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5:3b}
     volumes:
       - ./out:/app/out
       - ./stopwords.txt:/app/stopwords.txt
+    depends_on:
+      ollama-init:
+        condition: service_completed_successfully
+
+volumes:
+  ollama_data:

@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir \
     aiofiles \
     vaderSentiment \
     scikit-learn \
-    anthropic
+    openai
 
 # Bundle Swagger UI assets locally (avoids CDN dependency)
 RUN mkdir -p /app/static && \

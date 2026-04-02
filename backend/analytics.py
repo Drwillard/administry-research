@@ -4,7 +4,7 @@ import os, re, hmac, hashlib, html, json, logging
 from html.parser import HTMLParser
 from typing import Any, Optional
 
-import anthropic
+import openai
 import numpy as np
 import pandas as pd
 from sklearn.decomposition import NMF
@@ -16,7 +16,7 @@ import repository
 log = logging.getLogger("pipeline")
 
 ANON_SALT = os.environ.get("ANON_SALT")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 _sia = SentimentIntensityAnalyzer()
 
@@ -149,9 +149,9 @@ def run_pipeline() -> dict:
 
     log.info("anonymising IDs")
     notes["client_key"] = notes["clientID"].apply(lambda v: stable_hmac(v, salt))
-    notes["author_key"] = notes["personID"].apply(lambda v: stable_hmac(v, salt))
+    notes["author_key"] = notes["caseworkerID"].apply(lambda v: stable_hmac(v, salt))
     notes["agency_key"] = notes["agencyID"].apply(lambda v: stable_hmac(v, salt))
-    notes = notes.drop(columns=[c for c in ["clientID", "personID", "agencyID"] if c in notes.columns])
+    notes = notes.drop(columns=[c for c in ["clientID", "caseworkerID", "agencyID"] if c in notes.columns])
 
     notes_long = repository.write_notes_by_client(notes)
     repository.write_timeseries_packed(notes_long)
@@ -350,55 +350,51 @@ _SUMMARISE_PROMPT = (
     "Return only the phrase, no punctuation, no explanation.\n\nNote:\n{text}"
 )
 
-# Limit concurrent API calls to avoid rate limits
-_SEMAPHORE = asyncio.Semaphore(5)
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
+
+# Ollama handles one request at a time by default
+_SEMAPHORE = asyncio.Semaphore(2)
 
 
-async def _summarise_note(client: anthropic.AsyncAnthropic, text: str) -> str:
+async def _summarise_note(client: openai.AsyncOpenAI, text: str) -> str:
     async with _SEMAPHORE:
-        response = await client.messages.create(
-            model="claude-opus-4-6",
+        response = await client.chat.completions.create(
+            model=OLLAMA_MODEL,
             max_tokens=40,
             messages=[{"role": "user", "content": _SUMMARISE_PROMPT.format(text=text)}],
         )
-        return next(
-            (b.text.strip() for b in response.content if b.type == "text"), ""
-        )
+        return (response.choices[0].message.content or "").strip()
 
 
-async def summarise_client_notes(
-    min_notes: int,
-    agency_key: Optional[str],
-    max_notes_per_client: int,
-) -> list[dict]:
+async def summarise_and_save(
+    min_notes: int = 3,
+    max_notes_per_client: int = 10,
+) -> int:
     """
-    For each client, call the LLM to summarise each of their notes into a short
-    phrase, then return a per-client list of {note_id, date, summary} entries.
-
-    Notes are processed concurrently (up to 5 in-flight at once). Clients with
-    fewer than min_notes scored notes are excluded. Results are sorted by most
-    recent note first.
+    For each client in notes_long_by_client.parquet, call the LLM to summarise
+    each note into a short phrase. Results are written to note_summaries.parquet
+    after each client completes so progress is preserved if interrupted.
+    Returns the number of clients summarised.
     """
-    if not ANTHROPIC_API_KEY:
-        raise RuntimeError("ANTHROPIC_API_KEY is not configured.")
-
     df = repository.read_parquet("notes_long_by_client.parquet")
     df["ddate"] = pd.to_datetime(df["ddate"], utc=True, errors="coerce")
     df = df.dropna(subset=["vnote", "ddate"]).copy()
     df["vnote"] = df["vnote"].astype(str).str.strip()
     df = df[df["vnote"] != ""]
 
-    if agency_key is not None:
-        df = df[df["agency_key"] == agency_key]
+    ai = openai.AsyncOpenAI(api_key="ollama", base_url=OLLAMA_BASE_URL)
+    rows: list[dict] = []
 
-    ai = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-
-    async def process_client(client_key: str, group: pd.DataFrame) -> Optional[dict]:
+    for client_key, group in df.groupby("client_key"):
         group = group.sort_values("ddate")
         if len(group) < min_notes:
-            return None
+            continue
 
         notes_to_summarise = group.head(max_notes_per_client)
+        note_count = len(group)
+        last_note = group["ddate"].max().isoformat()
+        agency_key = group["agency_key"].iloc[0] if "agency_key" in group.columns else None
 
         tasks = [
             _summarise_note(ai, row["vnote"])
@@ -406,26 +402,18 @@ async def summarise_client_notes(
         ]
         summaries = await asyncio.gather(*tasks)
 
-        return {
-            "client_key": client_key,
-            "note_count": len(group),
-            "last_note": group["ddate"].max().isoformat(),
-            "summaries": [
-                {
-                    "note_id": int(row["noteID"]) if not pd.isna(row["noteID"]) else None,
-                    "date": row["ddate"].isoformat(),
-                    "summary": summary,
-                }
-                for (_, row), summary in zip(notes_to_summarise.iterrows(), summaries)
-            ],
-        }
+        for (_, row), summary in zip(notes_to_summarise.iterrows(), summaries):
+            rows.append({
+                "client_key": client_key,
+                "agency_key": agency_key,
+                "note_count": note_count,
+                "last_note": last_note,
+                "event_id": row["event_id"],
+                "date": row["ddate"].isoformat(),
+                "summary": summary,
+            })
 
-    client_tasks = [
-        process_client(client_key, group)
-        for client_key, group in df.groupby("client_key")
-    ]
-    results = await asyncio.gather(*client_tasks)
+        repository.write_note_summaries(rows)
+        log.info("summarised client %s... (%d clients done)", client_key[:8], len(set(r["client_key"] for r in rows)))
 
-    results = [r for r in results if r is not None]
-    results.sort(key=lambda r: r["last_note"], reverse=True)
-    return results
+    return len(set(r["client_key"] for r in rows))
