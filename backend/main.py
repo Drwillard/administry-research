@@ -9,7 +9,10 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.openapi.docs import get_swagger_ui_html
 
 from repository import DATABASE_URL
-from analytics import ANON_SALT, run_pipeline, load_sentiment_trends, extract_client_themes, stable_hmac, summarise_and_save
+from analytics import (
+    ANON_SALT, run_pipeline, run_predictive_pipeline,
+    load_sentiment_trends, extract_client_themes, stable_hmac, summarise_and_save,
+)
 import repository
 
 
@@ -34,12 +37,16 @@ def custom_swagger_ui():
     )
 
 
+log = logging.getLogger("pipeline")
+
+
 async def _ingest_and_summarise():
     try:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, run_pipeline)
         await summarise_and_save()
-        log.info("ingest + summarisation complete")
+        await loop.run_in_executor(None, run_predictive_pipeline)
+        log.info("ingest + summarisation + predictive pipeline complete")
     except Exception:
         log.exception("ingest background task failed")
 
@@ -57,14 +64,37 @@ async def ingest(background_tasks: BackgroundTasks):
 
 @app.post("/ingest/sync")
 async def ingest_sync():
-    """Trigger the pipeline + summarisation synchronously. Blocks until complete."""
+    """Trigger the pipeline + summarisation + predictive pipeline synchronously. Blocks until complete."""
     try:
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, run_pipeline)
         clients = await summarise_and_save()
+        predictive = await loop.run_in_executor(None, run_predictive_pipeline)
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
-    return {"status": "complete", **result, "clients_summarised": clients}
+    return {"status": "complete", **result, "clients_summarised": clients, "predictive": predictive}
+
+
+@app.post("/ingest/predict", status_code=202)
+async def ingest_predict(
+    background_tasks: BackgroundTasks,
+    horizon_days: int = Query(default=90, description="Forecast horizon in days"),
+):
+    """Trigger only the predictive pipeline (no-show, re-engagement, service demand, aid demand) in the background."""
+    if not repository.DATABASE_URL:
+        raise HTTPException(status_code=500, detail="DATABASE_URL is not configured.")
+    if not ANON_SALT:
+        raise HTTPException(status_code=500, detail="ANON_SALT is not configured.")
+
+    async def _run():
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda: run_predictive_pipeline(horizon_days))
+        except Exception:
+            log.exception("predictive pipeline background task failed")
+
+    background_tasks.add_task(_run)
+    return {"status": "accepted", "horizon_days": horizon_days}
 
 
 @app.get("/notes")
@@ -220,6 +250,153 @@ def client_notes_v2(
     return {
         "clients_analysed": len(results),
         "results": results[:limit],
+    }
+
+
+@app.get("/predict/noshowrisk")
+def predict_noshowrisk(
+    agency_id: Optional[str] = Query(default=None, description="Filter to a specific agency"),
+    risk_level: Optional[str] = Query(default=None, description="Filter by risk level: high, medium, or low"),
+    limit: int = Query(default=50, description="Maximum rows to return"),
+    offset: int = Query(default=0, description="Row offset for pagination"),
+):
+    """
+    Per-client appointment no-show risk scores. Risk is derived from historical no-show rate,
+    days since last appointment, and average household size.
+    Requires /ingest to have completed first.
+    """
+    try:
+        df = repository.read_parquet("predict_noshow_risk.parquet")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="No data found. Run /ingest first.")
+
+    if agency_id is not None:
+        df = df[df["agency_key"] == _agency_key(agency_id)]
+    if risk_level is not None:
+        df = df[df["risk_level"] == risk_level]
+
+    df = df.sort_values("risk_score", ascending=False)
+    total = len(df)
+    page = df.iloc[offset: offset + limit]
+
+    return {
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "results": page.astype(object).where(page.notna(), None).to_dict(orient="records"),
+    }
+
+
+@app.get("/predict/reengagement")
+def predict_reengagement(
+    agency_id: Optional[str] = Query(default=None, description="Filter to a specific agency"),
+    status: Optional[str] = Query(default=None, description="Filter by status: active, at_risk, lapsed, or churned"),
+    limit: int = Query(default=50, description="Maximum rows to return"),
+    offset: int = Query(default=0, description="Row offset for pagination"),
+):
+    """
+    Per-client re-engagement risk scores. Risk reflects how overdue a client is relative to their
+    typical activity cadence across notes, pledges, referrals, and appointments.
+    Requires /ingest to have completed first.
+    """
+    try:
+        df = repository.read_parquet("predict_reengagement_risk.parquet")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="No data found. Run /ingest first.")
+
+    if agency_id is not None:
+        df = df[df["agency_key"] == _agency_key(agency_id)]
+    if status is not None:
+        df = df[df["status"] == status]
+
+    df = df.sort_values("reengagement_risk", ascending=False)
+    total = len(df)
+    page = df.iloc[offset: offset + limit]
+
+    return {
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "results": page.astype(object).where(page.notna(), None).to_dict(orient="records"),
+    }
+
+
+@app.get("/predict/service-demand")
+def predict_service_demand(
+    agency_id: Optional[str] = Query(default=None, description="Filter to a specific agency"),
+    service_type: Optional[str] = Query(default=None, description="Filter by service type"),
+    horizon_days: int = Query(default=90, description="Forecast horizon in days (recomputed from stored slope)"),
+    limit: int = Query(default=50, description="Maximum rows to return"),
+    offset: int = Query(default=0, description="Row offset for pagination"),
+):
+    """
+    Per-agency per-service referral volume forecast. Trend and slope are computed at ingest time;
+    forecast_referrals is recomputed on read using the stored slope and the requested horizon.
+    Requires /ingest to have completed first.
+    """
+    try:
+        df = repository.read_parquet("predict_service_demand.parquet")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="No data found. Run /ingest first.")
+
+    if agency_id is not None:
+        df = df[df["agency_key"] == _agency_key(agency_id)]
+    if service_type is not None:
+        df = df[df["service_type"] == service_type]
+
+    # Recompute forecast for the requested horizon using stored model params
+    df = df.copy()
+    df["forecast_referrals"] = (
+        df["avg_monthly_referrals"] + df["slope"] * (horizon_days / 30.44)
+    ).clip(lower=0).round(1)
+    df["horizon_days"] = horizon_days
+
+    total = len(df)
+    page = df.sort_values(["agency_key", "service_name"]).iloc[offset: offset + limit]
+
+    return {
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "results": page.astype(object).where(page.notna(), None).to_dict(orient="records"),
+    }
+
+
+@app.get("/predict/aid-demand")
+def predict_aid_demand(
+    agency_id: Optional[str] = Query(default=None, description="Filter to a specific agency"),
+    horizon_days: int = Query(default=90, description="Forecast horizon in days (recomputed from stored slope)"),
+    limit: int = Query(default=50, description="Maximum rows to return"),
+    offset: int = Query(default=0, description="Row offset for pagination"),
+):
+    """
+    Per-agency financial aid demand forecast. Projects total pledge dollars expected over
+    the horizon period based on historical monthly trend.
+    Requires /ingest to have completed first.
+    """
+    try:
+        df = repository.read_parquet("predict_aid_demand.parquet")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="No data found. Run /ingest first.")
+
+    if agency_id is not None:
+        df = df[df["agency_key"] == _agency_key(agency_id)]
+
+    # Recompute forecast for the requested horizon using stored model params
+    df = df.copy()
+    df["forecast_total_aid"] = (
+        df["avg_monthly_aid"] + df["slope_per_month"] * (horizon_days / 30.44)
+    ).clip(lower=0).round(2)
+    df["horizon_days"] = horizon_days
+
+    total = len(df)
+    page = df.sort_values("agency_key").iloc[offset: offset + limit]
+
+    return {
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "results": page.astype(object).where(page.notna(), None).to_dict(orient="records"),
     }
 
 

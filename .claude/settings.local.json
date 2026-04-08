@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker run --rm -v C:/code/administry-research:/app python:3.12-slim python3 -c ':*)",
+      "Bash(docker run --rm -v C:/code/administry-research/frontend:/app -w /app node:20-slim sh -c ':*)",
+      "Bash(docker run --rm -v C:/code/administry-research/frontend:/frontend node:20-slim sh -c ':*)",
+      "Bash(docker run:*)"
+    ]
+  }
+}

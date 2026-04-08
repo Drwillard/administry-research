@@ -136,3 +136,88 @@ def read_parquet(filename: str) -> pd.DataFrame:
     if not os.path.exists(path):
         raise FileNotFoundError(path)
     return pd.read_parquet(path)
+
+
+def write_parquet(df: pd.DataFrame, filename: str) -> None:
+    """Write a DataFrame to a named parquet file in OUT_DIR."""
+    df.to_parquet(os.path.join(OUT_DIR, filename), index=False)
+    log.info("wrote %s (%d rows)", filename, len(df))
+
+
+# --- Predictive data fetches ---
+
+def fetch_appointments(database_url: str) -> pd.DataFrame:
+    """Fetch appointments with status name and household count from audit."""
+    engine = create_engine(database_url)
+    q = text("""
+        SELECT
+            A.appointmentID,
+            A.agencyID,
+            A.clientID,
+            A.ddate,
+            COALESCE(S.vstatus, '') AS vstatus,
+            COALESCE(AA.iClientHouseholdCount, 0) AS household_count
+        FROM Appointment A
+        LEFT JOIN AppointmentStatus S
+            ON A.appointmentstatusID = S.appointmentstatusID
+        LEFT JOIN (
+            SELECT appointmentID, MAX(iClientHouseholdCount) AS iClientHouseholdCount
+            FROM AppointmentAudit
+            GROUP BY appointmentID
+        ) AA ON A.appointmentID = AA.appointmentID
+        WHERE A.ddate IS NOT NULL
+    """)
+    df = pd.read_sql(q, engine)
+    log.info("fetched %d appointments", len(df))
+    return df
+
+
+def fetch_activity_events(database_url: str) -> pd.DataFrame:
+    """Fetch all client activity events (notes, pledges, referrals, appointments) as a unified timeline."""
+    engine = create_engine(database_url)
+    q = text("""
+        SELECT clientID, agencyID, 'note'        AS event_type, ddate FROM `Note`       WHERE ddate IS NOT NULL
+        UNION ALL
+        SELECT clientID, agencyID, 'pledge'      AS event_type, ddate FROM Pledge       WHERE ddate IS NOT NULL AND bvoid = 0 AND bpending = 0
+        UNION ALL
+        SELECT clientID, agencyID, 'referral'    AS event_type, ddate FROM Referral     WHERE ddate IS NOT NULL
+        UNION ALL
+        SELECT clientID, agencyID, 'appointment' AS event_type, ddate FROM Appointment  WHERE ddate IS NOT NULL
+    """)
+    df = pd.read_sql(q, engine)
+    log.info("fetched %d activity events", len(df))
+    return df
+
+
+def fetch_referrals_with_service(database_url: str) -> pd.DataFrame:
+    """Fetch referrals joined to service name and type for time-series demand analysis."""
+    engine = create_engine(database_url)
+    q = text("""
+        SELECT
+            R.agencyID,
+            R.ddate,
+            COALESCE(S.vname, 'Unknown') AS service_name,
+            COALESCE(S.vtype, 'Unknown') AS service_type
+        FROM Referral R
+        JOIN Service S ON R.serviceID = S.serviceID
+        WHERE R.ddate IS NOT NULL
+    """)
+    df = pd.read_sql(q, engine)
+    log.info("fetched %d referrals for demand forecast", len(df))
+    return df
+
+
+def fetch_pledges_for_forecast(database_url: str) -> pd.DataFrame:
+    """Fetch non-void, approved pledge amounts and dates for financial aid forecasting."""
+    engine = create_engine(database_url)
+    q = text("""
+        SELECT agencyID, ddate, decamount
+        FROM Pledge
+        WHERE bvoid = 0
+          AND bpending = 0
+          AND decamount > 0
+          AND ddate IS NOT NULL
+    """)
+    df = pd.read_sql(q, engine)
+    log.info("fetched %d pledges for aid forecast", len(df))
+    return df

@@ -343,6 +343,263 @@ def extract_client_themes(
     return results, topics
 
 
+# --- Predictive pipeline ---
+
+_NOSHOW_RE = re.compile(r"no.?show|missed|did not|cancel|absent", re.IGNORECASE)
+
+
+def _is_noshow(vstatus: str) -> bool:
+    return bool(_NOSHOW_RE.search(vstatus)) if vstatus else False
+
+
+def _safe_div(num: float, den: float, default: float = 0.0) -> float:
+    return num / den if den else default
+
+
+def _linear_trend(values: np.ndarray) -> dict:
+    """Fit a linear trend to a 1-D array of evenly-spaced monthly values."""
+    n = len(values)
+    if n < 2:
+        return {"slope": 0.0, "r_squared": None, "trend": "stable", "confidence": "low"}
+    x = np.arange(n, dtype=float)
+    slope, intercept = np.polyfit(x, values, 1)
+    y_pred = slope * x + intercept
+    ss_res = float(np.sum((values - y_pred) ** 2))
+    ss_tot = float(np.sum((values - values.mean()) ** 2))
+    r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else (1.0 if abs(slope) < 1e-9 else 0.0)
+    threshold = max(0.05 * float(values.mean()), 1e-6)
+    if slope > threshold:
+        trend = "increasing"
+    elif slope < -threshold:
+        trend = "decreasing"
+    else:
+        trend = "stable"
+    if r_squared >= 0.7 and n >= 6:
+        confidence = "high"
+    elif r_squared >= 0.4 or n >= 3:
+        confidence = "medium"
+    else:
+        confidence = "low"
+    return {"slope": round(float(slope), 4), "r_squared": round(r_squared, 4),
+            "trend": trend, "confidence": confidence}
+
+
+def compute_noshow_risk(appointments: pd.DataFrame, as_of: pd.Timestamp) -> pd.DataFrame:
+    df = appointments.dropna(subset=["ddate"]).copy()
+    df["iClientHouseholdCount"] = pd.to_numeric(df["household_count"], errors="coerce").fillna(0)
+    df["is_noshow"] = df["vstatus"].fillna("").apply(_is_noshow)
+
+    rows = []
+    for (agency_key, client_key), g in df.groupby(["agency_key", "client_key"]):
+        total = len(g)
+        noshows = int(g["is_noshow"].sum())
+        noshow_rate = _safe_div(noshows, total)
+        last_appt = g["ddate"].max()
+        days_since = max(int((as_of - last_appt).days), 0) if pd.notna(last_appt) else 365
+        avg_hh = float(g["iClientHouseholdCount"].mean())
+
+        inactivity = min(days_since, 365) / 365.0
+        hh_score = min(avg_hh, 8) / 8.0
+        risk = round(0.50 * noshow_rate + 0.35 * inactivity + 0.15 * hh_score, 4)
+        risk_level = "high" if risk >= 0.65 else "medium" if risk >= 0.35 else "low"
+
+        rows.append({
+            "agency_key": agency_key,
+            "client_key": client_key,
+            "total_appointments": total,
+            "noshows": noshows,
+            "noshow_rate": round(noshow_rate, 4),
+            "days_since_last_appointment": days_since,
+            "avg_household_size": round(avg_hh, 1),
+            "risk_score": risk,
+            "risk_level": risk_level,
+        })
+
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        result = result.sort_values("risk_score", ascending=False).reset_index(drop=True)
+    log.info("computed no-show risk for %d clients", len(result))
+    return result
+
+
+def compute_reengagement_risk(activity: pd.DataFrame, as_of: pd.Timestamp) -> pd.DataFrame:
+    df = activity.dropna(subset=["ddate"]).copy()
+
+    rows = []
+    for (agency_key, client_key), g in df.groupby(["agency_key", "client_key"]):
+        g = g.sort_values("ddate")
+        last_activity = g["ddate"].max()
+        days_inactive = max(int((as_of - last_activity).days), 0)
+        total_events = len(g)
+        distinct_types = int(g["event_type"].nunique())
+
+        if len(g) >= 2:
+            gaps = g["ddate"].diff().dt.days.dropna()
+            avg_gap: Optional[float] = float(gaps.mean()) if len(gaps) else None
+        else:
+            avg_gap = None
+
+        if days_inactive <= 30:
+            status = "active"
+        elif days_inactive <= 90:
+            status = "at_risk"
+        elif days_inactive <= 180:
+            status = "lapsed"
+        else:
+            status = "churned"
+
+        inactivity_score = min(days_inactive, 365) / 365.0
+        cadence_score = min(avg_gap / 180.0, 1.0) if avg_gap is not None else 0.5
+        diversity_penalty = (4 - min(distinct_types, 4)) / 4.0
+        risk = round(0.50 * inactivity_score + 0.30 * cadence_score + 0.20 * diversity_penalty, 4)
+
+        rows.append({
+            "agency_key": agency_key,
+            "client_key": client_key,
+            "last_activity": last_activity.isoformat(),
+            "days_inactive": days_inactive,
+            "total_events": total_events,
+            "distinct_activity_types": distinct_types,
+            "avg_days_between_events": round(avg_gap, 1) if avg_gap is not None else None,
+            "status": status,
+            "reengagement_risk": risk,
+        })
+
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        result = result.sort_values("reengagement_risk", ascending=False).reset_index(drop=True)
+    log.info("computed re-engagement risk for %d clients", len(result))
+    return result
+
+
+def compute_service_demand(referrals: pd.DataFrame, horizon_days: int) -> pd.DataFrame:
+    df = referrals.dropna(subset=["ddate"]).copy()
+    df["month"] = df["ddate"].dt.to_period("M")
+
+    rows = []
+    for (agency_key, service_name, service_type), g in df.groupby(["agency_key", "service_name", "service_type"]):
+        monthly = g.groupby("month").size()
+        # Fill missing months with 0 to make a dense series
+        full_range = pd.period_range(monthly.index.min(), monthly.index.max(), freq="M")
+        monthly = monthly.reindex(full_range, fill_value=0)
+        values = monthly.values.astype(float)
+        n = len(values)
+
+        trend_info = _linear_trend(values)
+        avg_monthly = round(float(values.mean()), 2)
+        recent_3mo_avg = round(float(values[-3:].mean()), 2)
+
+        rows.append({
+            "agency_key": agency_key,
+            "service_name": service_name,
+            "service_type": service_type,
+            "months_of_data": n,
+            "avg_monthly_referrals": avg_monthly,
+            "recent_3mo_avg": recent_3mo_avg,
+            "trend": trend_info["trend"],
+            "slope": trend_info["slope"],
+            "r_squared": trend_info["r_squared"],
+            "confidence": trend_info["confidence"],
+            "horizon_days": horizon_days,
+        })
+
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        result = result.sort_values(["agency_key", "service_name"]).reset_index(drop=True)
+    log.info("computed service demand forecast for %d agency+service pairs", len(result))
+    return result
+
+
+def compute_aid_demand(pledges: pd.DataFrame, horizon_days: int) -> pd.DataFrame:
+    df = pledges.dropna(subset=["ddate"]).copy()
+    df["decamount"] = df["decamount"].astype(float)
+    df["month"] = df["ddate"].dt.to_period("M")
+
+    rows = []
+    for agency_key, g in df.groupby("agency_key"):
+        monthly = g.groupby("month")["decamount"].sum()
+        full_range = pd.period_range(monthly.index.min(), monthly.index.max(), freq="M")
+        monthly = monthly.reindex(full_range, fill_value=0.0)
+        values = monthly.values.astype(float)
+        n = len(values)
+
+        trend_info = _linear_trend(values)
+        avg_monthly = round(float(values.mean()), 2)
+        recent_3mo_avg = round(float(values[-3:].mean()), 2)
+
+        rows.append({
+            "agency_key": agency_key,
+            "months_of_data": n,
+            "avg_monthly_aid": avg_monthly,
+            "recent_3mo_avg_aid": recent_3mo_avg,
+            "trend": trend_info["trend"],
+            "slope_per_month": trend_info["slope"],
+            "r_squared": trend_info["r_squared"],
+            "confidence": trend_info["confidence"],
+            "horizon_days": horizon_days,
+        })
+
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        result = result.sort_values("agency_key").reset_index(drop=True)
+    log.info("computed aid demand forecast for %d agencies", len(result))
+    return result
+
+
+def run_predictive_pipeline(horizon_days: int = 90) -> dict:
+    if not repository.DATABASE_URL:
+        raise RuntimeError("Missing DATABASE_URL env var.")
+    if not ANON_SALT:
+        raise RuntimeError("Missing ANON_SALT env var.")
+    os.makedirs(repository.OUT_DIR, exist_ok=True)
+
+    salt = ANON_SALT.encode("utf-8")
+    as_of = pd.Timestamp.now(tz="UTC")
+
+    log.info("predictive pipeline — fetching appointments")
+    appts = repository.fetch_appointments(repository.DATABASE_URL)
+    appts["ddate"] = pd.to_datetime(appts["ddate"], errors="coerce", utc=True)
+    appts["client_key"] = appts["clientID"].apply(lambda v: stable_hmac(v, salt))
+    appts["agency_key"] = appts["agencyID"].apply(lambda v: stable_hmac(v, salt))
+    appts = appts.drop(columns=["clientID", "agencyID", "appointmentID"])
+    noshow_df = compute_noshow_risk(appts, as_of)
+    repository.write_parquet(noshow_df, "predict_noshow_risk.parquet")
+
+    log.info("predictive pipeline — fetching activity timeline")
+    activity = repository.fetch_activity_events(repository.DATABASE_URL)
+    activity["ddate"] = pd.to_datetime(activity["ddate"], errors="coerce", utc=True)
+    activity["client_key"] = activity["clientID"].apply(lambda v: stable_hmac(v, salt))
+    activity["agency_key"] = activity["agencyID"].apply(lambda v: stable_hmac(v, salt))
+    activity = activity.drop(columns=["clientID", "agencyID"])
+    reeng_df = compute_reengagement_risk(activity, as_of)
+    repository.write_parquet(reeng_df, "predict_reengagement_risk.parquet")
+
+    log.info("predictive pipeline — fetching referrals for demand forecast")
+    referrals = repository.fetch_referrals_with_service(repository.DATABASE_URL)
+    referrals["ddate"] = pd.to_datetime(referrals["ddate"], errors="coerce", utc=True)
+    referrals["agency_key"] = referrals["agencyID"].apply(lambda v: stable_hmac(v, salt))
+    referrals = referrals.drop(columns=["agencyID"])
+    service_df = compute_service_demand(referrals, horizon_days)
+    repository.write_parquet(service_df, "predict_service_demand.parquet")
+
+    log.info("predictive pipeline — fetching pledges for aid forecast")
+    pledges = repository.fetch_pledges_for_forecast(repository.DATABASE_URL)
+    pledges["ddate"] = pd.to_datetime(pledges["ddate"], errors="coerce", utc=True)
+    pledges["agency_key"] = pledges["agencyID"].apply(lambda v: stable_hmac(v, salt))
+    pledges = pledges.drop(columns=["agencyID"])
+    aid_df = compute_aid_demand(pledges, horizon_days)
+    repository.write_parquet(aid_df, "predict_aid_demand.parquet")
+
+    result = {
+        "clients_scored_noshow": len(noshow_df),
+        "clients_scored_reengagement": len(reeng_df),
+        "agency_service_pairs_forecast": len(service_df),
+        "agencies_forecast_aid": len(aid_df),
+    }
+    log.info("predictive pipeline done — %s", result)
+    return result
+
+
 # --- LLM note summarisation ---
 
 _SUMMARISE_PROMPT = (
