@@ -1,14 +1,16 @@
 'use client'
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useMemo } from 'react'
 import { Flame } from 'lucide-react'
 import { api, type AuthorBurnoutResult } from '@/lib/api'
 import { useAgency } from '@/app/providers'
 import {
   PageShell, Card, LoadingRows, EmptyState, ErrorState,
-  Table, Th, Td, Tr,
+  Table, Th, SortableTh, Td, Tr,
 } from '@/components/page-shell'
 import { SentimentBar, SlopeChip } from '@/components/trend-badge'
 import { fmtDate, shortKey } from '@/lib/utils'
+
+type SortKey = 'author_key' | 'note_count' | 'slope' | 'early_avg_sentiment' | 'recent_avg_sentiment' | 'delta' | 'first_note' | 'last_note'
 
 export default function BurnoutPage() {
   const { agencyId } = useAgency()
@@ -18,6 +20,8 @@ export default function BurnoutPage() {
   const [error, setError]         = useState('')
   const [minNotes, setMinNotes]   = useState(5)
   const [slopeThreshold, setSlopeThreshold] = useState(0)
+  const [sortKey, setSortKey]     = useState<SortKey>('slope')
+  const [sortDir, setSortDir]     = useState<'asc' | 'desc'>('asc')
 
   useEffect(() => {
     setLoading(true); setError('')
@@ -25,6 +29,24 @@ export default function BurnoutPage() {
       .then(r => { setData(r.results); setTotal(r.authors_flagged); setLoading(false) })
       .catch(e => { setError(e.message); setLoading(false) })
   }, [agencyId, minNotes, slopeThreshold])
+
+  function handleSort(key: string) {
+    if (key === sortKey) setSortDir(d => d === 'asc' ? 'desc' : 'asc')
+    else { setSortKey(key as SortKey); setSortDir('asc') }
+  }
+
+  const sorted = useMemo(() => {
+    if (!data) return data
+    return [...data].sort((a, b) => {
+      const av = a[sortKey] ?? '', bv = b[sortKey] ?? ''
+      const cmp = av < bv ? -1 : av > bv ? 1 : 0
+      return sortDir === 'asc' ? cmp : -cmp
+    })
+  }, [data, sortKey, sortDir])
+
+  const col = (key: SortKey, label: string) => (
+    <SortableTh colKey={key} sortKey={sortKey} sortDir={sortDir} onSort={handleSort}>{label}</SortableTh>
+  )
 
   return (
     <PageShell
@@ -63,19 +85,24 @@ export default function BurnoutPage() {
 
         {error && <ErrorState error={error} />}
 
-        {loading ? <LoadingRows rows={8} /> : !data?.length ? (
+        {loading ? <LoadingRows rows={8} /> : !sorted?.length ? (
           <EmptyState message="No authors flagged with current filters." />
         ) : (
           <Table>
             <thead>
               <tr>
-                <Th>Author</Th><Th>Notes</Th><Th>Slope</Th>
-                <Th>Early sentiment</Th><Th>Recent sentiment</Th>
-                <Th>Δ Delta</Th><Th>First note</Th><Th>Last note</Th>
+                <Th>Author</Th>
+                {col('note_count', 'Notes')}
+                {col('slope', 'Slope')}
+                {col('early_avg_sentiment', 'Early sentiment')}
+                {col('recent_avg_sentiment', 'Recent sentiment')}
+                {col('delta', 'Δ Delta')}
+                {col('first_note', 'First note')}
+                {col('last_note', 'Last note')}
               </tr>
             </thead>
             <tbody>
-              {data.map(r => (
+              {sorted.map(r => (
                 <Tr key={r.author_key}>
                   <Td><span className="font-mono text-xs text-gray-400">{shortKey(r.author_key)}</span></Td>
                   <Td><span className="tabular-nums">{r.note_count}</span></Td>

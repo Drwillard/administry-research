@@ -607,17 +607,30 @@ _SUMMARISE_PROMPT = (
     "Return only the phrase, no punctuation, no explanation.\n\nNote:\n{text}"
 )
 
-OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
+_LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "ollama")  # "ollama" | "openai"
+_OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+_OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")
+_OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+_OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
-# Ollama handles one request at a time by default
-_SEMAPHORE = asyncio.Semaphore(2)
+# Ollama is effectively serial; OpenAI can handle more concurrency
+_SEMAPHORE = asyncio.Semaphore(2 if _LLM_PROVIDER == "ollama" else 10)
+
+
+def _make_llm_client() -> openai.AsyncOpenAI:
+    if _LLM_PROVIDER == "openai":
+        return openai.AsyncOpenAI(api_key=_OPENAI_API_KEY)
+    return openai.AsyncOpenAI(api_key="ollama", base_url=_OLLAMA_BASE_URL)
+
+
+def _llm_model() -> str:
+    return _OPENAI_MODEL if _LLM_PROVIDER == "openai" else _OLLAMA_MODEL
 
 
 async def _summarise_note(client: openai.AsyncOpenAI, text: str) -> str:
     async with _SEMAPHORE:
         response = await client.chat.completions.create(
-            model=OLLAMA_MODEL,
+            model=_llm_model(),
             max_tokens=40,
             messages=[{"role": "user", "content": _SUMMARISE_PROMPT.format(text=text)}],
         )
@@ -640,14 +653,13 @@ async def summarise_and_save(
     df["vnote"] = df["vnote"].astype(str).str.strip()
     df = df[df["vnote"] != ""]
 
-    ai = openai.AsyncOpenAI(api_key="ollama", base_url=OLLAMA_BASE_URL)
+    eligible = [(k, g.sort_values("ddate")) for k, g in df.groupby("client_key") if len(g) >= min_notes]
+    total_clients = len(eligible)
+    log.info("summarising with provider=%s model=%s — %d clients to process", _LLM_PROVIDER, _llm_model(), total_clients)
+    ai = _make_llm_client()
     rows: list[dict] = []
 
-    for client_key, group in df.groupby("client_key"):
-        group = group.sort_values("ddate")
-        if len(group) < min_notes:
-            continue
-
+    for i, (client_key, group) in enumerate(eligible, 1):
         notes_to_summarise = group.head(max_notes_per_client)
         note_count = len(group)
         last_note = group["ddate"].max().isoformat()
@@ -671,6 +683,7 @@ async def summarise_and_save(
             })
 
         repository.write_note_summaries(rows)
-        log.info("summarised client %s... (%d clients done)", client_key[:8], len(set(r["client_key"] for r in rows)))
+        log.info("[%d/%d] client %s — %d notes summarised", i, total_clients, client_key[:8], len(notes_to_summarise))
 
-    return len(set(r["client_key"] for r in rows))
+    log.info("summarisation complete — %d clients saved", total_clients)
+    return total_clients

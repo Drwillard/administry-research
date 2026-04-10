@@ -1,4 +1,5 @@
 import { type LucideIcon } from 'lucide-react'
+import { ChevronUp, ChevronDown, ChevronsUpDown } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 export function PageShell({
@@ -110,6 +111,36 @@ export function Th({ children, className }: { children: React.ReactNode; classNa
       className,
     )}>
       {children}
+    </th>
+  )
+}
+
+export function SortableTh({
+  children, colKey, sortKey, sortDir, onSort, className,
+}: {
+  children: React.ReactNode
+  colKey: string
+  sortKey: string
+  sortDir: 'asc' | 'desc'
+  onSort: (key: string) => void
+  className?: string
+}) {
+  const active = sortKey === colKey
+  return (
+    <th
+      onClick={() => onSort(colKey)}
+      className={cn(
+        'px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider bg-gray-50 border-b border-surface-border cursor-pointer select-none whitespace-nowrap',
+        active ? 'text-violet-600' : 'text-gray-500 hover:text-gray-700',
+        className,
+      )}
+    >
+      <span className="inline-flex items-center gap-1">
+        {children}
+        {active
+          ? sortDir === 'asc' ? <ChevronUp size={12} /> : <ChevronDown size={12} />
+          : <ChevronsUpDown size={12} className="opacity-30" />}
+      </span>
     </th>
   )
 }
